@@ -1,0 +1,2 @@
+# jax-lytimet
+A Jax Equinox Implementation of the LYTIMET: TOWARDS ROBUST AND INTERPRETABLE STATE-VARIABLE DISCOVERY paper
