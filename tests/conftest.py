@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from lytimet.model import LyTimeT, LyTimeTConfig
-from lytimet.data import make_pendulum_batch
+from jax_lytimet.model import LyTimeT, LyTimeTConfig
+from jax_lytimet.data import make_pendulum_batch
 
 
 @pytest.fixture(scope="session")

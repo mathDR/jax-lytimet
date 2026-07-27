@@ -3,11 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lytimet"
+name = "jax-lytimet"
 version = "0.1.0"
 description = "JAX/Equinox/Optax implementation of LyTimeT (state-variable discovery via TimeSformer encoding + latent dynamics + Lyapunov regularization)"
 requires-python = ">=3.10"
-readme = "lytimet/README.md"
+readme = "jax-lytimet/README.md"
 dependencies = [
     "jax>=0.4.30",
     "jaxlib>=0.4.30",
@@ -33,12 +33,12 @@ test = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["lytimet*"]
+include = ["jax-lytimet*"]
 
 [tool.coverage.run]
-source = ["lytimet"]
+source = ["jax-lytimet"]
 omit = [
-    "lytimet/demo*.py",
+    "jax-lytimet/demo*.py",
 ]
 
 [tool.coverage.report]
