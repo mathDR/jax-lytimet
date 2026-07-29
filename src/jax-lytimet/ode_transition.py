@@ -22,11 +22,13 @@ paper's discrete `max(0, V(z_{t+1}) - V(z_t))` penalty).
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import diffrax
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
+from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 
 class ODEVectorField(eqx.Module):
@@ -39,13 +41,30 @@ class ODEVectorField(eqx.Module):
     norm: eqx.nn.LayerNorm
 
     def __init__(self, dz: int, hidden: int, *, key: PRNGKeyArray):
+        """Args:
+            dz: Latent state dimension.
+            hidden: Hidden-layer width of the vector-field MLP.
+            key: PRNG key, split internally for the three linear layers.
+        """
         k1, k2, k3 = jax.random.split(key, 3)
         self.norm = eqx.nn.LayerNorm(dz)
         self.fc1 = eqx.nn.Linear(dz + 1, hidden, key=k1)
         self.fc2 = eqx.nn.Linear(hidden, hidden, key=k2)
         self.fc3 = eqx.nn.Linear(hidden, dz, key=k3)
 
-    def __call__(self, t: Float[Array, ""], z: Float[Array, "Dz"], args=None) -> Float[Array, "Dz"]:
+    def __call__(
+        self, t: Float[Array, ""], z: Float[Array, "Dz"], args=None
+    ) -> Float[Array, "Dz"]:
+        """diffrax-compatible vector-field call: `(t, z, args) -> dz/dt`.
+
+        Args:
+            t: Current integration time (scalar).
+            z: Current latent state, shape `(Dz,)`.
+            args: Unused; present for diffrax's `ODETerm` call signature.
+
+        Returns:
+            `dz/dt` at `(t, z)`, shape `(Dz,)`.
+        """
         z_n = self.norm(z)
         t_feat = jnp.broadcast_to(t, (1,))
         h = jnp.concatenate([z_n, t_feat], axis=-1)
@@ -77,11 +96,28 @@ class NeuralODETransition(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
+        """Args:
+            dz: Latent state dimension.
+            hidden: Hidden-layer width of the vector-field MLP.
+            dt: Elapsed "time" corresponding to one discrete frame step.
+            num_internal_steps: Fixed number of internal solver steps used
+                to integrate across each `dt`.
+            key: PRNG key, forwarded to `ODEVectorField`.
+        """
         self.field = ODEVectorField(dz, hidden, key=key)
         self.dt = dt
         self.num_internal_steps = num_internal_steps
 
     def _solve(self, z0: Float[Array, "Dz"], t_span: float) -> Float[Array, "Dz"]:
+        """Integrate the vector field from `t=0` to `t=t_span` starting at `z0`.
+
+        Args:
+            z0: Initial latent state, shape `(Dz,)`.
+            t_span: Total integration time.
+
+        Returns:
+            Latent state at `t=t_span`, shape `(Dz,)`.
+        """
         term = diffrax.ODETerm(self.field)
         solver = diffrax.Tsit5()
         step_size = t_span / self.num_internal_steps
@@ -119,6 +155,7 @@ class NeuralODETransition(eqx.Module):
         """
 
         def step(z, _):
+            """One scan step: solve one dt-step forward via __call__."""
             z_next = self(z)
             return z_next, z_next
 
@@ -134,7 +171,7 @@ def continuous_lyapunov_loss(
     transition: "NeuralODETransition",
     w: Float[Array, "Dv Ds"],
     z_seq: Float[Array, "K Dz"],
-    select_idx=None,
+    select_idx: Optional[Int[Array, "Ds"]] = None,
 ) -> Float[Array, ""]:
     """Continuous-time analogue of the paper's discrete Lyapunov loss.
 
@@ -144,15 +181,29 @@ def continuous_lyapunov_loss(
     independent version of the paper's discrete
     `max(0, V(z_{t+1}) - V(z_t))` check.
 
-    `z_seq` holds *full* latent states (the ODE vector field is always
-    defined on the full d_z-dimensional state); `select_idx` restricts the
-    energy V, and its derivative, to the selected interpretable dimensions.
+    Args:
+        transition: A `NeuralODETransition` (or any object exposing a
+            compatible `vector_field(z)` method).
+        w: Lyapunov energy matrix, shape `(Dv, Ds)`, defining
+            `V(z~) = ||W z~||^2`.
+        z_seq: Full latent states along a trajectory, shape `(K, Dz)` (the
+            ODE vector field is always defined on the full `d_z`-dimensional
+            state).
+        select_idx: Optional indices, shape `(Ds,)`, restricting the energy
+            `V` and its derivative to the selected interpretable dimensions
+            `z_tilde`. If `None`, all `Dz` dimensions are used (`Ds = Dz`).
+
+    Returns:
+        Mean Lyapunov violation over the `K` states, a non-negative scalar.
     """
     dzdt = jax.vmap(lambda z: transition.vector_field(z))(z_seq)  # (K, Dz)
     z_tilde = z_seq if select_idx is None else z_seq[:, select_idx]
     dzdt_tilde = dzdt if select_idx is None else dzdt[:, select_idx]
 
-    def per_step(z, dz):
+    def per_step(
+        z: Float[Array, "Ds"], dz: Float[Array, "Ds"]
+    ) -> Float[Array, ""]:
+        """Lyapunov violation `max(0, dV/dt)` at a single state/derivative pair."""
         wz = w @ z
         dv_dt = 2.0 * jnp.dot(wz, w @ dz)
         return jnp.maximum(0.0, dv_dt)

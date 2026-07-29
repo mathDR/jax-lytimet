@@ -33,11 +33,46 @@ def prediction_loss(
     return jnp.mean(per_step)
 
 
+def latent_dynamics_matching_loss(
+    model: LyTimeT, z_seq: Float[Array, "T Dz"]
+) -> Float[Array, ""]:
+    """Directly supervise the dynamics module in latent space, using
+    *consecutive encoded latents from the same clip* as free teacher-forcing
+    targets -- no decoder, no multi-step rollout needed:
+
+        pred_{t+1} = model.transition(z_t)      # one step, either dynamics_type
+        loss       = || pred_{t+1} - z_{t+1} ||^2
+
+    Deliberately does NOT use a finite-difference derivative estimate
+    (z_{t+1} - z_t) / dt as the target, even for the Neural ODE transition.
+    Dividing by dt amplifies any encoder noise as dt shrinks (variance
+    scales like 1/dt^2), and for larger dt the difference quotient itself
+    is only an O(dt) approximation of the true derivative -- both are
+    avoidable. Since `NeuralODETransition.__call__` already integrates the
+    vector field over the true elapsed interval (rather than linearizing
+    it), comparing its output directly to the encoder's actual z_{t+1}
+    supervises exactly the quantity we care about (where the learned flow
+    lands after the true elapsed time) with no derivative-estimation error
+    at all. This also means the *same* one-line loss works unmodified for
+    both the residual-MLP and Neural ODE transitions.
+
+    This decouples dynamics-learning from reconstruction-learning: the
+    encoder is still trained via L_rec/L_pred, but the transition module
+    gets a direct, low-variance gradient signal about the actual latent
+    dynamics the encoder produced, independent of decoder quality.
+    """
+    z_t = z_seq[:-1]
+    z_tp1 = z_seq[1:]
+    pred = jax.vmap(model.transition)(z_t)
+    return jnp.mean(jnp.sum((pred - z_tp1) ** 2, axis=-1))
+
+
 def phase1_clip_loss(
     model: LyTimeT,
     clip: Float[Array, "T C H W"],
     k_steps: int,
     lambda_pred: float,
+    lambda_dyn: float = 0.0,
 ):
     """Single-clip Phase-1 loss: reconstruct the whole clip, then roll the
     transition model forward K steps from an early frame and compare against
@@ -47,6 +82,12 @@ def phase1_clip_loss(
     Uses the first frame of the clip as z_t and the remaining frames (up to
     k_steps of them) as the ground-truth future, mirroring the paper's
     "encode a window, unroll K steps, decode, compare" procedure.
+
+    If `lambda_dyn > 0`, also adds `latent_dynamics_matching_loss` -- a
+    cheap, direct, latent-space supervision signal for the dynamics module
+    (see that function's docstring). This is not part of the paper, but is
+    a natural, nearly-free addition since the encoder already produces
+    z_1..z_T for the whole clip.
     """
     recon, z = model.reconstruct_clip(clip)
     l_rec = reconstruction_loss(recon, clip)
@@ -58,7 +99,14 @@ def phase1_clip_loss(
     l_pred = prediction_loss(x_future_hat, x_future)
 
     l_phase1 = l_rec + lambda_pred * l_pred
-    aux = {"l_rec": l_rec, "l_pred": l_pred, "l_phase1": l_phase1}
+    aux = {"l_rec": l_rec, "l_pred": l_pred}
+
+    if lambda_dyn > 0.0:
+        l_dyn = latent_dynamics_matching_loss(model, z)
+        l_phase1 = l_phase1 + lambda_dyn * l_dyn
+        aux["l_dyn"] = l_dyn
+
+    aux["l_phase1"] = l_phase1
     return l_phase1, aux
 
 
@@ -100,18 +148,31 @@ def phase2_clip_loss(
     lambda_pred: float,
     lambda_lyap: float,
     select_idx: Float[Array, "Dv"] | None = None,
+    use_continuous_lyapunov: bool = False,
+    lambda_dyn: float = 0.0,
 ):
-    """Combined objective L = L_phase1 + lambda_lyap * L_lyap.
+    """Combined objective L = L_phase1 + lambda_lyap * L_lyap (+ optional
+    lambda_dyn * latent_dynamics_matching_loss, see phase1_clip_loss).
 
     `select_idx` are the indices of the top-ranked (most physically
     meaningful) latent dimensions z_tilde, as chosen by linear-probe
     ranking in Phase 2 (see probe.py). The Lyapunov loss is computed on
     the restriction of the encoded trajectory to those dimensions.
+
+    If `use_continuous_lyapunov` is True, the model's transition must be a
+    `NeuralODETransition` (see ode_transition.py); the exact continuous-time
+    dV/dt <= 0 penalty is used instead of the paper's discrete
+    max(0, V(z_{t+1}) - V(z_t)) check.
     """
-    l_phase1, aux = phase1_clip_loss(model, clip, k_steps, lambda_pred)
+    l_phase1, aux = phase1_clip_loss(model, clip, k_steps, lambda_pred, lambda_dyn)
 
     _, z = model.reconstruct_clip(clip)  # (T, Dz), full latent
-    l_lyap = lyapunov_loss(model.transition, w, z, select_idx)
+    if use_continuous_lyapunov:
+        from .ode_transition import continuous_lyapunov_loss
+
+        l_lyap = continuous_lyapunov_loss(model.transition, w, z, select_idx)
+    else:
+        l_lyap = lyapunov_loss(model.transition, w, z, select_idx)
 
     total = l_phase1 + lambda_lyap * l_lyap
     aux = {**aux, "l_lyap": l_lyap, "total": total}

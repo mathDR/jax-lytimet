@@ -13,15 +13,22 @@ they compose with `plt.show()`, artifact saving, or further tweaking.
 """
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 import matplotlib
 
 matplotlib.use("Agg")  # headless-safe; irrelevant if a display is present
 
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 import numpy as np
 import seaborn as sns
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+
+from .model import LyTimeT
 
 sns.set_theme(style="whitegrid", context="talk", palette="deep")
 
@@ -29,8 +36,22 @@ sns.set_theme(style="whitegrid", context="talk", palette="deep")
 # --------------------------------------------------------------------------
 # 1. Training curves
 # --------------------------------------------------------------------------
-def plot_training_curves(hist1, hist2=None, save_path: str | None = None):
-    """Line plot of Phase 1 (and optionally Phase 2) loss vs. training step."""
+def plot_training_curves(
+    hist1: list[float],
+    hist2: Optional[list[float]] = None,
+    save_path: Optional[str] = None,
+) -> Figure:
+    """Line plot of Phase 1 (and optionally Phase 2) loss vs. training step.
+
+    Args:
+        hist1: Per-step Phase-1 losses (e.g. from `train.train_phase1`).
+        hist2: Optional per-step Phase-2 losses, plotted continuing from
+            where `hist1` ends, with a vertical marker at the transition.
+        save_path: If given, save the figure as a PNG to this path.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
     fig, ax = plt.subplots(figsize=(7, 4.5))
     steps1 = np.arange(len(hist1))
     sns.lineplot(x=steps1, y=hist1, ax=ax, label="Phase 1 (rec + pred)", linewidth=2)
@@ -60,15 +81,26 @@ def plot_training_curves(hist1, hist2=None, save_path: str | None = None):
 # 2. Rollout frame grid: ground truth vs. predicted, over a horizon
 # --------------------------------------------------------------------------
 def plot_rollout_frames(
-    model,
-    clip: jnp.ndarray,
+    model: LyTimeT,
+    clip: Float[Array, "T C H W"],
     k_steps: int,
-    save_path: str | None = None,
+    save_path: Optional[str] = None,
     max_cols: int = 8,
-):
+) -> Figure:
     """Encode the first frame of `clip`, roll the transition model forward
     `k_steps`, decode each predicted latent, and show ground-truth vs.
-    predicted frames side by side (one column per rollout step)."""
+    predicted frames side by side (one column per rollout step).
+
+    Args:
+        model: Trained `LyTimeT` model.
+        clip: A single clip of shape `(T, C, H, W)`.
+        k_steps: Number of rollout steps to display.
+        save_path: If given, save the figure as a PNG to this path.
+        max_cols: Maximum number of columns (rollout steps) to display.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
     z, _ = model.encode(clip)
     x_future_hat, _ = model.forecast(z[0], k_steps)
     x_future_true = clip[1 : 1 + k_steps]
@@ -109,20 +141,33 @@ def plot_rollout_frames(
 # 3. Rollout error vs. horizon (shows whether error accumulates/contracts)
 # --------------------------------------------------------------------------
 def plot_rollout_error_vs_horizon(
-    models: dict,
-    clips: jnp.ndarray,
+    models: dict[str, LyTimeT],
+    clips: Float[Array, "B T C H W"],
     max_k: int,
-    save_path: str | None = None,
-):
+    save_path: Optional[str] = None,
+) -> Figure:
     """For each named model in `models` (e.g. {"before Lyapunov": m1,
     "after Lyapunov": m2}), roll out `max_k` steps on a batch of clips and
     plot mean per-step pixel MSE vs. horizon with a bootstrap CI band —
     this is the plot that shows whether error accumulation (roll-out
-    instability, the paper's central concern) is being controlled."""
+    instability, the paper's central concern) is being controlled.
+
+    Args:
+        models: Mapping from a display label to a trained `LyTimeT` model.
+        clips: Batch of clips, shape `(B, T, C, H, W)`, shared across all
+            models being compared.
+        max_k: Maximum rollout horizon to evaluate.
+        save_path: If given, save the figure as a PNG to this path.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
 
     for label, model in models.items():
         def per_clip_errors(clip):
+            """Per-step pixel MSE for one clip, rolled out from its first
+            encoded frame."""
             z, _ = model.encode(clip)
             k = min(max_k, clip.shape[0] - 1)
             x_hat, _ = model.forecast(z[0], k)
@@ -154,17 +199,28 @@ def plot_latent_vs_truth(
     z_tilde: np.ndarray,
     states: np.ndarray,
     dt: float = 0.1,
-    save_path: str | None = None,
-):
+    save_path: Optional[str] = None,
+) -> Figure:
     """For each extracted z_tilde dimension, overlay its (z-scored) trace
     against each (z-scored) ground-truth state variable it best aligns
     with, over time -- a visual check of what Table 1's MI/AMSE numbers
-    are quantifying."""
+    are quantifying.
+
+    Args:
+        z_tilde: Selected latent dimensions over time, shape `(T, n_select)`.
+        states: Ground-truth state variables over time, shape `(T, Ds)`.
+        dt: Time step between consecutive rows, used for the x-axis.
+        save_path: If given, save the figure as a PNG to this path.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
     z_tilde = np.asarray(z_tilde)
     states = np.asarray(states)
     t = np.arange(z_tilde.shape[0]) * dt
 
     def zscore(x):
+        """Per-column z-score normalization: `(x - mean) / (std + eps)`."""
         return (x - x.mean(axis=0)) / (x.std(axis=0) + 1e-8)
 
     z_n = zscore(z_tilde)
@@ -199,23 +255,136 @@ def plot_latent_vs_truth(
 
 
 # --------------------------------------------------------------------------
-# 5. Convenience: run everything and save a folder of figures
+# 5. Conformal prediction bands + coverage diagnostic
+# --------------------------------------------------------------------------
+def plot_conformal_band(
+    z_true: np.ndarray,
+    mean: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    dims: Optional[list[int]] = None,
+    dt: float = 0.1,
+    save_path: Optional[str] = None,
+) -> Figure:
+    """Plot the true latent trajectory against the ensemble mean and its
+    calibrated conformal interval, for one or more latent dimensions.
+
+    `z_true`, `mean`, `lower`, `upper` are all (K, Dz) (z_true should be the
+    K ground-truth future states, e.g. z_seq[1:1+K]); `dims` selects which
+    latent dimensions to plot (defaults to the first 3).
+
+    Args:
+        z_true: Ground-truth future latent states, shape `(K, Dz)`.
+        mean: Particle-ensemble mean prediction, shape `(K, Dz)`.
+        lower: Calibrated lower interval bound, shape `(K, Dz)`.
+        upper: Calibrated upper interval bound, shape `(K, Dz)`.
+        dims: Which latent dimensions to plot; defaults to the first 3.
+        dt: Time step between consecutive rows, used for the x-axis.
+        save_path: If given, save the figure as a PNG to this path.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
+    dz = mean.shape[-1]
+    dims = dims if dims is not None else list(range(min(3, dz)))
+    k = mean.shape[0]
+    t = np.arange(1, k + 1) * dt
+
+    fig, axes = plt.subplots(len(dims), 1, figsize=(7.5, 2.6 * len(dims)), sharex=True)
+    if len(dims) == 1:
+        axes = [axes]
+
+    for ax, d in zip(axes, dims):
+        ax.fill_between(t, lower[:, d], upper[:, d], alpha=0.25,
+                         label="Conformal interval", color=sns.color_palette()[0])
+        ax.plot(t, mean[:, d], label="Ensemble mean", linewidth=2,
+                color=sns.color_palette()[0])
+        ax.plot(t, z_true[:, d], label="True", linestyle="--", linewidth=2,
+                color=sns.color_palette()[1])
+        ax.set_ylabel(f"z_{d}")
+        ax.legend(fontsize=9, loc="upper left")
+
+    axes[-1].set_xlabel("Time")
+    fig.suptitle("Calibrated rollout intervals (particle ensemble + conformal)", fontsize=13)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_coverage_diagnostic(
+    coverage: np.ndarray,
+    target_coverage: float,
+    save_path: Optional[str] = None,
+) -> Figure:
+    """Bar plot of empirical per-step coverage (averaged over latent dims)
+    against the nominal target (1 - alpha) -- a sanity check that the
+    conformal calibration is actually achieving its guarantee.
+
+    Args:
+        coverage: Empirical per-(step, dim) coverage, shape `(K, Dz)` (or
+            `(K,)` if already dimension-averaged).
+        target_coverage: The nominal target coverage `1 - alpha`.
+        save_path: If given, save the figure as a PNG to this path.
+
+    Returns:
+        The matplotlib `Figure`.
+    """
+    coverage = np.asarray(coverage)
+    per_step = coverage.mean(axis=-1) if coverage.ndim > 1 else coverage
+    steps = np.arange(1, len(per_step) + 1)
+
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    sns.barplot(x=steps, y=per_step, ax=ax, color=sns.color_palette()[0])
+    ax.axhline(target_coverage, color="crimson", linestyle="--", linewidth=2,
+               label=f"Target coverage ({target_coverage:.0%})")
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel("Rollout horizon (steps)")
+    ax.set_ylabel("Empirical coverage")
+    ax.set_title("Conformal coverage diagnostic")
+    ax.legend()
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+# --------------------------------------------------------------------------
+# 6. Convenience: run everything and save a folder of figures
 # --------------------------------------------------------------------------
 def make_all_plots(
-    model_before_phase2,
-    model_after_phase2,
-    hist1,
-    hist2,
-    eval_clips: jnp.ndarray,
-    eval_states: jnp.ndarray,
-    select_idx,
+    model_before_phase2: LyTimeT,
+    model_after_phase2: LyTimeT,
+    hist1: list[float],
+    hist2: list[float],
+    eval_clips: Float[Array, "B T C H W"],
+    eval_states: Float[Array, "B T Ds"],
+    select_idx: Int[Array, "n_select"],
     k_steps: int,
     out_dir: str = "plots",
-):
+) -> dict[str, Figure]:
     """Generate the full set of diagnostic plots and save them as PNGs in
-    `out_dir`. Returns the dict of {name: matplotlib Figure}."""
-    import os
+    `out_dir`.
 
+    Args:
+        model_before_phase2: Model checkpoint after Phase 1 only.
+        model_after_phase2: Model checkpoint after Phase 2 (Lyapunov
+            fine-tuning).
+        hist1: Per-step Phase-1 losses.
+        hist2: Per-step Phase-2 losses.
+        eval_clips: Held-out clips for evaluation, shape `(B, T, C, H, W)`.
+        eval_states: Ground-truth states for the same clips, shape
+            `(B, T, Ds)`.
+        select_idx: Indices of the selected interpretable latent
+            dimensions, shape `(n_select,)`.
+        k_steps: Rollout horizon used for the rollout-related plots.
+        out_dir: Directory to save the PNGs into (created if missing).
+
+    Returns:
+        Dict mapping plot name (`"loss_curves"`, `"rollout_frames"`,
+        `"rollout_error_vs_horizon"`, `"latent_vs_truth"`) to its
+        matplotlib `Figure`.
+    """
     os.makedirs(out_dir, exist_ok=True)
     figs = {}
 
@@ -236,6 +405,7 @@ def make_all_plots(
     )
 
     def encode_only(clip):
+        """Encode one clip, discarding the patch tokens."""
         z, _ = model_after_phase2.encode(clip)
         return z
 

@@ -7,7 +7,7 @@ name = "jax-lytimet"
 version = "0.1.0"
 description = "JAX/Equinox/Optax implementation of LyTimeT (state-variable discovery via TimeSformer encoding + latent dynamics + Lyapunov regularization)"
 requires-python = ">=3.10"
-readme = "jax-lytimet/README.md"
+readme = "jax_lytimet/README.md"
 dependencies = [
     "jax>=0.4.30",
     "jaxlib>=0.4.30",
@@ -19,7 +19,6 @@ dependencies = [
     "matplotlib>=3.8",
     "seaborn>=0.13",
     "numpy>=1.26",
-    "pytest>=9.1.1",
 ]
 
 [project.optional-dependencies]
@@ -28,17 +27,13 @@ test = [
     "pytest-cov>=5.0",
 ]
 
-[tool.setuptools.package-dir]
-"" = "src"
-
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["jax-lytimet*"]
+include = ["jax_lytimet*"]
 
 [tool.coverage.run]
-source = ["jax-lytimet"]
+source = ["jax_lytimet"]
 omit = [
-    "jax-lytimet/demo*.py",
+    "jax_lytimet/demo*.py",
 ]
 
 [tool.coverage.report]
